@@ -1,6 +1,5 @@
 'use strict'
 
-const { generateKey, hkdf } = require('node:crypto')
 /** ******* Imports ********/
 
 const {
@@ -105,57 +104,70 @@ class MessengerClient {
   async sendMessage(name, plaintext) {
 
     if (!this.certs[name]) {
-      throw new Error('Certificate not found');
+      throw new Error('Certificate not found')
     }
 
     const hmac_to_aes_key_messageKey = 'hmac_to_aes_key_messageKey'
     
-    const header = {};
+    
 
     if (!this.conns[name]) {
       this.conns[name] = {}
       this.conns[name].pub_current = null
       this.conns[name].pub_new = this.certs[name].pub
-      // the first KeyChain (or the first RootKey)
-      this.conns[name].keyChain= await subtle.generateKey({ name: 'HMAC', hash: 'SHA-384' }, true, ['sign'])
+      this.conns[name].keyChain= await computeDH(this.EGKeyPair.sec, this.certs[name].pub)
+      this.conns[name].PN = 0
+      this.conns[name].N = 0
     }
 
-    header.keyChain = this.conns[name].keyChain
 
-    // check for the new receiving ratchet public key 
     if (this.conns[name].pub_new !== this.conns[name].pub_current) {
       const newEG_Key = await generateEG()
       this.conns[name].DH_key = await computeDH(newEG_Key.sec, this.conns[name].pub_new);
       const newKey = await HKDF(this.conns[name].DH_key, this.conns[name].keyChain, 'newKey');
       this.conns[name].keyChain = newKey[0]
       this.conns[name].sendingKeyRoot = newKey[1]
-      this.conns[name].pub_current = this.conns[name].pub_new // update the pubKey
+      this.conns[name].pub_current = this.conns[name].pub_new 
       this.conns[name].my_current_EG_Key = newEG_Key
+      this.conns[name].PN = this.conns[name].N
+      this.conns[name].N = 0
     }
 
-    // use hkdf to generate new key pair for sending message from the SendingKeyRoot
+
     const newSendingKeyPair = await HKDF(this.conns[name].DH_key, this.conns[name].sendingKeyRoot, 'newSendingKeyPair')
 
     this.conns[name].sendingKeyRoot = newSendingKeyPair[0]
-    this.conns[name].messageKey = newSendingKeyPair[1] //encrypt the message with this key
+    this.conns[name].messageKey = newSendingKeyPair[1] 
 
-    const ivGov = genRandomSalt(); //used as salt to derive the key to encrypt message
-    const receiverIV = genRandomSalt(); //used to encrypt the message
+    const ivGov = genRandomSalt()
+    const receiverIV = genRandomSalt()
 
     const messageKey1 = await HMACtoAESKey(this.conns[name].messageKey, hmac_to_aes_key_messageKey, true);
     const messageKey2 = await HMACtoAESKey(this.conns[name].messageKey, hmac_to_aes_key_messageKey, false)
     
-    header.vGov = this.conns[name].my_current_EG_Key.pub  // the goverment use this to combine with their secKey to compute DH shared key
-    header.ivGov = ivGov;
-    header.receiverIV = receiverIV;
+    const keyPairForGov = await generateEG()
 
-    // computeDH from self sec and govpub
-    let govKey = await computeDH(this.conns[name].my_current_EG_Key.sec, this.govPublicKey)
+    let govKey = await computeDH(keyPairForGov.sec, this.govPublicKey)
     govKey = await HMACtoAESKey(govKey, govEncryptionDataStr)
 
-    header.cGov = await encryptWithGCM(govKey, messageKey1, ivGov)  //the enc_messageKey
-    const ciphertext = await encryptWithGCM(messageKey2, plaintext, receiverIV, JSON.stringify(header)); //encrypt the message that send to receiver
+    const cGov = await encryptWithGCM(govKey, messageKey1, ivGov) 
+    const NHeader = this.conns[name].N
+    this.conns[name].N += 1
+    const PNHeader = this.conns[name].PN
 
+
+    const header = {
+      pub: this.conns[name].my_current_EG_Key.pub,
+      vGov: keyPairForGov.pub,
+      ivGov: ivGov,
+      receiverIV: receiverIV,
+      cGov: cGov,
+      N: NHeader,
+      PN: PNHeader,
+    }
+
+    const ciphertext = await encryptWithGCM(messageKey2, plaintext, receiverIV, JSON.stringify(header)); //encrypt the message that send to receiver
+    
     return [header, ciphertext];
   }
 
@@ -175,32 +187,117 @@ class MessengerClient {
     process.stdout.write(`${name}: `);
     const hmac_to_aes_key_messageKey = 'hmac_to_aes_key_messageKey'
 
-    // compute key for decrypting
     if (!this.conns[name]){
       this.conns[name] = {}
-      this.conns[name].my_current_EG_Key = this.EGKeyPair
       this.conns[name].pub_current = null
       this.conns[name].pub_new = this.certs[name].pub
-      }
+      this.conns[name].keyChain = await computeDH(this.EGKeyPair.sec, this.certs[name].pub)
+      this.conns[name].currentReceivingChainLength = 0
+      this.conns[name].numberSkippedMessagesInCurrentReceivingChain = 0
+      this.conns[name].numberSkippedMessagesInNewReceivingChain = 0
+      this.conns[name].skippedMessageKeys = {current:{},newReceive:{}} 
+      this.conns[name].my_current_EG_Key = this.EGKeyPair
+      this.conns[name].cnt = 0
+    }
+    // console.log(this.conns[name])
 
-    if (this.conns[name].pub_new !== header.vGov){
-      this.conns[name].keyChain = header.keyChain
-      this.conns[name].DH_key = await computeDH(this.conns[name].my_current_EG_Key.sec, header.vGov)      // prevent from eavesdroping
-      const newKey = await HKDF(this.conns[name].DH_key, header.keyChain, 'newKey');
-      this.conns[name].keyChain = newKey[0]
-      this.conns[name].receivingKeyRoot = newKey[1]
-      this.conns[name].pub_new = header.vGov
+    if (this.conns[name].pub_new !== header.pub){
+      this.conns[name].numberSkippedMessagesInCurrentReceivingChain = header.PN - this.conns[name].currentReceivingChainLength
+      this.conns[name].numberSkippedMessagesInNewReceivingChain = header.N
+      // console.log(this.conns[name].numberSkippedMessagesInCurrentReceivingChain, this.conns[name].numberSkippedMessagesInNewReceivingChain)
+    }
+      
+    else {
+      this.conns[name].numberSkippedMessagesInCurrentReceivingChain = header.N - this.conns[name].currentReceivingChainLength
     }
 
-    const newReceivingKeyPair = await HKDF(this.conns[name].DH_key, this.conns[name].receivingKeyRoot, 'newSendingKeyPair')// prevent from the replay attack, because the receivingKey is always generated each time
-    this.conns[name].receivingKeyRoot = newReceivingKeyPair[0]
-    this.conns[name].messageKey = newReceivingKeyPair[1]
+    this.conns[name].currentReceivingChainLength += 1
 
-    const messageKey = await HMACtoAESKey(this.conns[name].messageKey, hmac_to_aes_key_messageKey, false)
-    let plaintext = await decryptWithGCM(messageKey, ciphertext, header.receiverIV, JSON.stringify(header))
-    plaintext = bufferToString(plaintext)
-    console.log(plaintext)
-    return plaintext;
+
+    if (this.conns[name].pub_new !== header.pub){
+
+      if (this.conns[name].numberSkippedMessagesInCurrentReceivingChain !== 0){
+        let receivingKey = this.conns[name].receivingKeyRoot
+        for (let i = this.conns[name].currentReceivingChainLength; i < header.PN; i++ ){
+          const newReceivingKeyPair = await HKDF(this.conns[name].DH_key, receivingKey, 'newSendingKeyPair')
+          this.conns[name].skippedMessageKeys.current[i] = newReceivingKeyPair[1]
+          receivingKey = newReceivingKeyPair[0]
+        }
+
+      }
+      if (this.conns[name].numberSkippedMessagesInNewReceivingChain !== 0){
+
+        this.conns[name].DH_key = await computeDH(this.conns[name].my_current_EG_Key.sec, header.pub)
+        const newKey = await HKDF(this.conns[name].DH_key, this.conns[name].keyChain, 'newKey')
+        this.conns[name].keyChain = newKey[0]
+        this.conns[name].receivingKeyRoot = newKey[1]
+        let receivingKey = this.conns[name].receivingKeyRoot
+        for (let i = 0; i < header.N; i++){
+          const newReceivingKeyPair = await HKDF(this.conns[name].DH_key, receivingKey, 'newSendingKeyPair')
+          this.conns[name].skippedMessageKeys.newReceive[i] = newReceivingKeyPair[1]
+          receivingKey = newReceivingKeyPair[0]
+        }
+
+      }
+
+
+    }
+    else if(this.conns[name].pub_new === header.pub && this.conns[name].numberSkippedMessagesInCurrentReceivingChain !== 0){
+
+      let receivingKey = this.conns[name].receivingKeyRoot
+
+      for (let i = this.conns[name].currentReceivingChainLength - 1; i < header.N; i++ ){
+        const newReceivingKeyPair = await HKDF(this.conns[name].DH_key, receivingKey, 'newSendingKeyPair')
+        this.conns[name].skippedMessageKeys.current[i] = newReceivingKeyPair[1]
+        receivingKey = newReceivingKeyPair[0]
+        }
+      this.conns[name].receivingKeyRoot = receivingKey
+
+
+    }
+
+    console.log(this.conns[name].skippedMessageKeys)
+
+    if (this.conns[name].pub_new !== header.pub){ 
+      this.conns[name].DH_key = await computeDH(this.conns[name].my_current_EG_Key.sec, header.pub)
+      const newKey = await HKDF(this.conns[name].DH_key, this.conns[name].keyChain, 'newKey')
+      this.conns[name].keyChain = newKey[0]
+      this.conns[name].receivingKeyRoot = newKey[1]
+      this.conns[name].pub_new = header.pub
+
+      this.conns[name].cnt = 0
+    }
+
+    if(header.N >= this.conns[name].cnt){
+      let newReceivingKeyPair = await HKDF(this.conns[name].DH_key, this.conns[name].receivingKeyRoot, 'newSendingKeyPair')
+ 
+      this.conns[name].receivingKeyRoot = newReceivingKeyPair[0]
+   
+      this.conns[name].messageKey = newReceivingKeyPair[1]
+  
+      // decrypt
+      const messageKey = await HMACtoAESKey(this.conns[name].messageKey, hmac_to_aes_key_messageKey, false)
+
+      let plaintext = await decryptWithGCM(messageKey, ciphertext, header.receiverIV, JSON.stringify(header))
+
+      plaintext = bufferToString(plaintext)
+  
+      console.log(plaintext)
+      this.conns[name].cnt += 1
+      return plaintext
+    }
+
+    else {
+      const messageKey = await HMACtoAESKey(this.conns[name].skippedMessageKeys.current[header.N], hmac_to_aes_key_messageKey, false)
+      let plaintext = await decryptWithGCM(messageKey, ciphertext, header.receiverIV, JSON.stringify(header))
+      plaintext = bufferToString(plaintext)
+      console.log(plaintext)
+      this.conns[name].cnt += 1
+      return plaintext
+    }
+    
+
+
   }
 
 }
